@@ -5,6 +5,58 @@ use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::thread;
 
+extern crate flate2;
+use flate2::write::{GzEncoder, ZlibEncoder};
+use flate2::Compression;
+
+#[derive(Debug, PartialEq, Clone, Copy)]
+enum CompressionScheme {
+    Gzip,
+    Zlib,
+}
+
+struct CompressionUtil;
+
+impl CompressionUtil {
+    fn supported_schemes() -> Vec<CompressionScheme> {
+        vec![CompressionScheme::Gzip, CompressionScheme::Zlib]
+    }
+
+    fn compress(data: &[u8], scheme: CompressionScheme) -> io::Result<Vec<u8>> {
+        match scheme {
+            CompressionScheme::Gzip => {
+                let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+                encoder.write_all(data)?;
+                encoder.finish()
+            }
+            CompressionScheme::Zlib => {
+                let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+                encoder.write_all(data)?;
+                encoder.finish()
+            }
+        }
+    }
+
+    fn scheme_to_header(scheme: CompressionScheme) -> &'static str {
+        match scheme {
+            CompressionScheme::Gzip => "gzip",
+            CompressionScheme::Zlib => "zlib",
+        }
+    }
+
+    fn negotiate_compression(accept_encoding: &str) -> Option<CompressionScheme> {
+        let encodings: Vec<String> = accept_encoding
+            .split(',')
+            .map(|s| s.trim().to_lowercase())
+            .collect();
+
+        Self::supported_schemes().into_iter().find(|&scheme| {
+            let scheme_str = Self::scheme_to_header(scheme).to_lowercase();
+            encodings.contains(&scheme_str)
+        })
+    }
+}
+
 #[derive(Clone)]
 struct ServerConfig {
     port: u16,
@@ -41,6 +93,11 @@ impl HttpResponse {
             .push(("Content-Type".to_string(), content_type.to_string()));
         self.headers
             .push(("Content-Length".to_string(), self.body.len().to_string()));
+        self
+    }
+
+    fn with_header(mut self, key: &str, value: &str) -> Self {
+        self.headers.push((key.to_string(), value.to_string()));
         self
     }
 
@@ -107,10 +164,16 @@ impl Router {
     }
 
     fn handle_request(req: &HttpRequest, config: &ServerConfig) -> HttpResponse {
+        let compression_scheme = req
+            .headers
+            .iter()
+            .find(|(k, _)| k.to_lowercase() == "accept-encoding")
+            .and_then(|(_, v)| CompressionUtil::negotiate_compression(v));
+
         match (req.method.as_str(), req.path.as_str()) {
-            ("GET", "/") => Self::hello_world(),
-            ("GET", "/user-agent") => Self::user_agent(req),
-            (_method, path) if path.starts_with("/echo/") => Self::echo(path),
+            ("GET", "/") => Self::hello_world(compression_scheme),
+            ("GET", "/user-agent") => Self::user_agent(req, compression_scheme),
+            (_method, path) if path.starts_with("/echo/") => Self::echo(path, compression_scheme),
             (method, path) if path.starts_with("/files/") => {
                 let filename = &path[7..];
                 match method {
@@ -123,23 +186,26 @@ impl Router {
         }
     }
 
-    fn hello_world() -> HttpResponse {
-        HttpResponse::new(200, "OK").with_body("Hello, World!".as_bytes().to_vec(), "text/plain")
+    fn hello_world(compression: Option<CompressionScheme>) -> HttpResponse {
+        let body = "Hello, World!".as_bytes().to_vec();
+        Self::compress_response(body, "text/plain", compression)
     }
 
-    fn user_agent(req: &HttpRequest) -> HttpResponse {
+    fn user_agent(req: &HttpRequest, compression: Option<CompressionScheme>) -> HttpResponse {
         req.headers
             .iter()
             .find(|(k, _)| k == "User-Agent")
             .map(|(_, v)| {
-                HttpResponse::new(200, "OK").with_body(v.as_bytes().to_vec(), "text/plain")
+                let body = v.as_bytes().to_vec();
+                Self::compress_response(body, "text/plain", compression)
             })
             .unwrap_or_else(|| HttpResponse::new(400, "Bad Request"))
     }
 
-    fn echo(path: &str) -> HttpResponse {
+    fn echo(path: &str, compression: Option<CompressionScheme>) -> HttpResponse {
         let message = &path[6..];
-        HttpResponse::new(200, "OK").with_body(message.as_bytes().to_vec(), "text/plain")
+        let body = message.as_bytes().to_vec();
+        Self::compress_response(body, "text/plain", compression)
     }
 
     fn serve_file(filename: &str, config: &ServerConfig) -> HttpResponse {
@@ -167,6 +233,25 @@ impl Router {
                 Err(_) => HttpResponse::new(500, "Internal Server Error"),
             },
             None => HttpResponse::new(400, "Bad Request"),
+        }
+    }
+
+    fn compress_response(
+        body: Vec<u8>,
+        content_type: &str,
+        compression: Option<CompressionScheme>,
+    ) -> HttpResponse {
+        match compression {
+            Some(scheme) => match CompressionUtil::compress(&body, scheme) {
+                Ok(compressed_body) => HttpResponse::new(200, "OK")
+                    .with_body(compressed_body, content_type)
+                    .with_header(
+                        "Content-Encoding",
+                        CompressionUtil::scheme_to_header(scheme),
+                    ),
+                Err(_) => HttpResponse::new(200, "OK").with_body(body, content_type),
+            },
+            None => HttpResponse::new(200, "OK").with_body(body, content_type),
         }
     }
 
